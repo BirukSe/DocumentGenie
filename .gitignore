@@ -17,6 +17,7 @@
 # next.js
 /.next/
 /out/
+/frontend/.next/
 /frontend/.env.local
 /frontend/.env
 /backend/venv
