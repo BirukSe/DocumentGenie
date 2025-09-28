@@ -20,56 +20,184 @@ except LookupError:
 class PDFProcessor:
     def __init__(self):
         self.temp_dir = tempfile.mkdtemp()
+        
+    def change_background_color(self, input_path: str, color: str = "#FFFFFF", opacity: float = 1.0) -> str:
+        """
+        Change the background color of all pages in the PDF.
+        
+        Args:
+            input_path: Path to the input PDF file
+            color: Background color in hex format (e.g., '#FFFF00' for yellow) or color name
+            opacity: Opacity of the background color (0.0 to 1.0, default: 1.0)
+            
+        Returns:
+            str: Path to the modified PDF file
+            
+        Raises:
+            FileNotFoundError: If the input file doesn't exist
+            ValueError: If the color or opacity is invalid
+            Exception: For any other errors during processing
+        """
+        try:
+            import webcolors
+            from reportlab.lib.colors import HexColor
+            
+            # Clean and validate input path
+            input_path = str(input_path).strip('"\'').strip()
+            if not os.path.exists(input_path):
+                raise FileNotFoundError(f"Input file not found: {input_path}")
+                
+            # Validate opacity
+            if not 0.0 <= opacity <= 1.0:
+                raise ValueError("Opacity must be between 0.0 and 1.0")
+            
+            # Convert color name to hex if needed
+            try:
+                if not color.startswith('#'):
+                    color = webcolors.name_to_hex(color)
+                # Validate hex color format
+                if not re.match(r'^#(?:[0-9a-fA-F]{3}){1,2}$', color):
+                    raise ValueError(f"Invalid color format: {color}")
+            except (ValueError, AttributeError) as e:
+                if not color.startswith('#'):
+                    color = f"#{color}"
+                if not re.match(r'^#(?:[0-9a-fA-F]{3}){1,2}$', color):
+                    raise ValueError(f"Invalid color format: {color}") from e
+            
+            # Create output path in the same directory as input
+            base_name = os.path.basename(input_path)
+            output_path = os.path.join(
+                os.path.dirname(os.path.abspath(input_path)),
+                f"bg_{os.path.basename(input_path)}"
+            )
+            
+            # Open the source PDF
+            doc = fitz.open(input_path)
+            
+            # Create a new PDF with the background color
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_rect = page.rect
+                
+                # Create a new PDF with the background color
+                packet = io.BytesIO()
+                c = canvas.Canvas(packet, pagesize=(page_rect.width, page_rect.height))
+                
+                # Set fill color with opacity
+                c.setFillColor(HexColor(color), alpha=opacity)
+                
+                # Draw a rectangle covering the entire page
+                c.rect(0, 0, page_rect.width, page_rect.height, fill=1, stroke=0)
+                c.save()
+                
+                # Move to the beginning of the buffer
+                packet.seek(0)
+                
+                # Open the background PDF
+                background = fitz.open("pdf", packet.read())
+                
+                # Merge the original page with the background
+                page.show_pdf_page(page_rect, background, 0, overlay=True)
+                background.close()
+            
+            # Save the modified PDF
+            doc.save(output_path)
+            doc.close()
+            
+            return output_path
+            
+        except Exception as e:
+            raise Exception(f"Error changing background color: {str(e)}")
     
     def load_pdf(self, file_path: str) -> fitz.Document:
         """Load PDF document"""
         return fitz.open(file_path)
     
     def analyze_document(self, pdf_path: str) -> Dict[str, Any]:
-        """Comprehensive document analysis with formatting details"""
-        doc = fitz.open(pdf_path)
-        analysis = {
-            "pages": len(doc),
-            "page_details": [],
-            "fonts_used": set(),
-            "colors_used": set(),
-            "has_images": False,
-            "has_tables": False,
-            "text_blocks": [],
-            "paragraphs": [],
-            "bullet_points": [],
-            "headings": []
-        }
+        """
+        Comprehensive document analysis with formatting details
         
-        for page_num in range(len(doc)):
-            page = doc[page_num]
-            page_dict = page.get_text("dict")
+        Args:
+            pdf_path: Path to the PDF file to analyze
             
-            page_info = {
-                "page_number": page_num + 1,
-                "width": page.rect.width,
-                "height": page.rect.height,
-                "text_blocks": len(page_dict.get("blocks", [])),
-                "images": len(page.get_images()),
-                "annotations": len(page.annots())
+        Returns:
+            Dict containing analysis results including pages, fonts, colors, and document structure
+            
+        Raises:
+            FileNotFoundError: If the PDF file doesn't exist
+            Exception: For any errors during analysis
+        """
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+            
+        doc = None
+        try:
+            doc = fitz.open(pdf_path)
+            analysis = {
+                "pages": len(doc),
+                "page_details": [],
+                "fonts_used": set(),
+                "colors_used": set(),
+                "has_images": False,
+                "has_tables": False,
+                "text_blocks": [],
+                "paragraphs": [],
+                "bullet_points": [],
+                "headings": []
             }
             
-            # Extract text with formatting
-            for block in page_dict.get("blocks", []):
-                if "lines" in block:
-                    for line in block["lines"]:
-                        for span in line["spans"]:
-                            analysis["fonts_used"].add(span.get("font", ""))
-                            analysis["colors_used"].add(span.get("color", 0))
-                            
-                            text = span.get("text", "").strip()
-                            if text:
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                
+                # Handle potential generator objects by converting to list
+                page_dict = page.get_text("dict")
+                blocks = list(page_dict.get("blocks", []))  # Ensure blocks is a list, not a generator
+                images = list(page.get_images())  # Convert generator to list
+                
+                # Convert any generator to list before calculating length
+                annotations = list(page.annots() or [])  # Handle None case
+                
+                # Check for tables (simple check - could be enhanced)
+                has_tables = any(block.get('type') == 1 for block in blocks)
+                
+                page_info = {
+                    "page_number": page_num + 1,
+                    "width": page.rect.width,
+                    "height": page.rect.height,
+                    "text_blocks": len(blocks),
+                    "images": len(images),
+                    "annotations": len(annotations),
+                    "has_tables": has_tables
+                }
+                
+                # Update global analysis flags
+                if has_tables:
+                    analysis["has_tables"] = True
+                if images:
+                    analysis["has_images"] = True
+                
+                # Extract text with formatting
+                for block in blocks:
+                    if "lines" in block:
+                        for line in block["lines"]:
+                            for span in line["spans"]:
+                                font = span.get("font", "")
+                                color = span.get("color", 0)
+                                if font:
+                                    analysis["fonts_used"].add(font)
+                                if color:
+                                    analysis["colors_used"].add(color)
+                                
+                                text = span.get("text", "").strip()
+                                if not text:
+                                    continue
+                                    
                                 # Detect headings (larger font size or bold)
                                 if span.get("size", 0) > 14 or span.get("flags", 0) & 2**4:
                                     analysis["headings"].append({
                                         "text": text,
                                         "page": page_num + 1,
-                                        "font": span.get("font", ""),
+                                        "font": font,
                                         "size": span.get("size", 0)
                                     })
                                 
@@ -86,18 +214,22 @@ class PDFProcessor:
                                         "page": page_num + 1,
                                         "type": "numbered"
                                     })
+                
+                analysis["page_details"].append(page_info)
             
-            if page.get_images():
-                analysis["has_images"] = True
+            # Convert sets to lists for JSON serialization
+            analysis["fonts_used"] = sorted(list(analysis["fonts_used"]))
+            analysis["colors_used"] = sorted(list(analysis["colors_used"]))
             
-            analysis["page_details"].append(page_info)
-        
-        # Convert sets to lists for JSON serialization
-        analysis["fonts_used"] = list(analysis["fonts_used"])
-        analysis["colors_used"] = list(analysis["colors_used"])
-        
-        doc.close()
-        return analysis
+            return analysis
+            
+        except Exception as e:
+            raise Exception(f"Error analyzing PDF: {str(e)}")
+            
+        finally:
+            # Ensure the document is always closed
+            if doc is not None:
+                doc.close()
     
     def replace_text_with_formatting(self, pdf_path: str, old_text: str, new_text: str, 
                                    preserve_formatting: bool = True, fuzzy_match: bool = True) -> str:

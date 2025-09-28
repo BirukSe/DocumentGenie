@@ -3,8 +3,10 @@ from typing import Type, Optional, List, Dict, Any
 from pydantic import BaseModel, Field
 from services.pdf_service import PDFProcessor
 import fitz  # PyMuPDF
+import io
 import json
 import os
+from reportlab.pdfgen import canvas
 
 # Input schemas for all tools
 class AnalyzePDFInput(BaseModel):
@@ -196,84 +198,150 @@ class SplitPDFInput(BaseModel):
     split_points: List[int] = Field(description="Page numbers where to split the document")
 
 class ChangeBackgroundColorInput(BaseModel):
-    pdf_path: str = Field(description="Path to the PDF file")
-    color: str = Field(description="Background color in hex format (e.g., '#FFFFFF' for white, '#000000' for black)", 
-                      pattern=r'^#(?:[0-9a-fA-F]{3}){1,2}$')
-    opacity: Optional[float] = Field(default=1.0, ge=0.0, le=1.0, 
-                                   description="Opacity of the background color (0.0 to 1.0, default: 1.0)")
+    file_path: str = Field(default=None, description="Path to the PDF file")
+    pdf_path: str = Field(default=None, description="[Deprecated] Use file_path instead. Path to the PDF file")
+    color: str = Field(default="yellow", 
+                     description="Background color in hex format (e.g., '#FFFF00' for yellow) or color name (e.g., 'yellow')")
+    opacity: float = Field(default=1.0, ge=0.0, le=1.0, 
+                         description="Opacity of the background color (0.0 to 1.0, default: 1.0)")
+    
+    class Config:
+        extra = "allow"  # Allow extra fields to be passed
 
 class ChangeBackgroundColorTool(BaseTool):
     name: str = "change_background_color"
     description: str = "Change the background color of all pages in the PDF"
     args_schema: Type[BaseModel] = ChangeBackgroundColorInput
     
-    def _run(self, pdf_path: str, color: str, opacity: float = 1.0) -> str:
+    def _run(self, *args, **kwargs) -> str:
         """
         Change the background color of all pages in the PDF.
         
         Args:
-            pdf_path: Path to the PDF file
-            color: Background color in hex format (e.g., '#FFFFFF' for white)
-            opacity: Opacity of the background (0.0 to 1.0, default: 1.0)
+            pdf_path: Path to the PDF file (deprecated, use file_path instead)
+            file_path: Path to the PDF file
+            color: Background color in hex format (e.g., '#FFFF00' for yellow) or color name (e.g., 'yellow')
+            opacity: Opacity of the background color (0.0 to 1.0, default: 0.3)
             
         Returns:
-            str: Path to the modified PDF file or an error message
+            str: Path to the modified PDF file or error message
         """
         try:
-            # Convert hex color to RGB
-            color = color.lstrip('#')
-            r = int(color[0:2], 16) / 255.0
-            g = int(color[2:4], 16) / 255.0
-            b = int(color[4:6], 16) / 255.0
+            # Handle JSON string input (common from API calls)
+            if len(args) == 1 and isinstance(args[0], str) and args[0].startswith('{') and args[0].endswith('}'):
+                import json
+                try:
+                    input_data = json.loads(args[0])
+                    kwargs.update(input_data)
+                    args = []
+                except json.JSONDecodeError:
+                    pass
             
-            # Open the PDF
-            doc = fitz.open(pdf_path)
+            # Handle both direct arguments and dictionary input
+            if len(args) == 1 and isinstance(args[0], str):
+                # If a single string is provided, treat it as the file path
+                input_path = args[0]
+                color = 'yellow'  # Default color
+                opacity = 0.3     # Default opacity
+            elif len(args) > 1:
+                # If multiple args, assume they're in order: file_path, color, opacity
+                input_path = args[0]
+                color = args[1] if len(args) > 1 else 'yellow'
+                try:
+                    opacity = float(args[2]) if len(args) > 2 else 0.3
+                except (ValueError, TypeError):
+                    opacity = 0.3
+            else:
+                # Use kwargs
+                input_path = kwargs.get('file_path') or kwargs.get('pdf_path')
+                color = kwargs.get('color', 'yellow')
+                try:
+                    opacity = float(kwargs.get('opacity', 0.3))
+                except (ValueError, TypeError):
+                    opacity = 0.3
             
-            # Process each page
-            for page_num in range(len(doc)):
-                page = doc[page_num]
+            if not input_path:
+                return "Error: No file path provided. Please provide either file_path or pdf_path."
                 
-                # Create a new page with the background color
-                page_rect = page.rect
-                
-                # Create a new PDF with the background color
-                packet = io.BytesIO()
-                c = canvas.Canvas(packet, pagesize=(page_rect.width, page_rect.height))
-                
-                # Set fill color with opacity
-                c.setFillColorRGB(r, g, b, alpha=opacity)
-                
-                # Draw a rectangle covering the entire page
-                c.rect(0, 0, page_rect.width, page_rect.height, fill=1, stroke=0)
-                
-                # Save the background
-                c.save()
-                
-                # Move to the beginning of the buffer
-                packet.seek(0)
-                
-                # Open the background PDF
-                background = fitz.open("pdf", packet.read())
-                
-                # Get the first page of the background
-                background_page = background[0]
-                
-                # Merge the original page with the background
-                page.show_pdf_page(page_rect, background, 0, overlay=True)
-                
-                # Clean up
-                background.close()
+            # If input_path is a dict (from JSON input), extract the path
+            if isinstance(input_path, dict):
+                input_path = input_path.get('file_path') or input_path.get('pdf_path')
+                if not input_path:
+                    return "Error: Invalid input format. Expected file_path or pdf_path in the input."
             
-            # Save the modified PDF
-            output_path = os.path.join(os.path.dirname(pdf_path), 
-                                     f"bg_{os.path.basename(pdf_path)}")
-            doc.save(output_path)
-            doc.close()
+            # Clean up the input path if it's wrapped in quotes or has extra spaces
+            input_path = str(input_path).strip('"\'').strip()
             
-            return f"Successfully changed background color. Modified file saved to: {output_path}"
+            # Ensure the file exists
+            if not os.path.exists(input_path):
+                return f"Error: File not found: {input_path}"
+                
+            # Validate color format
+            if not color.startswith('#'):
+                # Try to convert color name to hex
+                try:
+                    import webcolors
+                    color = webcolors.name_to_hex(color)
+                except (ValueError, AttributeError):
+                    # If not a named color, assume it's a hex code without #
+                    if not color.startswith('#'):
+                        color = f"#{color}"
+            
+            # Ensure opacity is between 0 and 1
+            try:
+                opacity = float(opacity)
+                opacity = max(0.0, min(1.0, opacity))
+            except (ValueError, TypeError):
+                opacity = 0.3
+            
+            # Create output path in the same directory as the input file
+            input_dir = os.path.dirname(input_path)
+            input_filename = os.path.basename(input_path)
+            output_filename = f"bg_{input_filename}"
+            output_path = os.path.join(input_dir, output_filename)
+            
+            try:
+                # Use the PDFProcessor to handle the background color change
+                pdf_processor = PDFProcessor()
+                result_path = pdf_processor.change_background_color(
+                    input_path=input_path,
+                    color=color,
+                    opacity=opacity
+                )
+                
+                # Verify the result
+                if not result_path or not os.path.exists(result_path):
+                    return {
+                        "success": False,
+                        "error": f"Failed to generate output file at {result_path}",
+                        "result_path": None
+                    }
+                
+                # If the result_path is different from our expected output_path, rename it
+                if result_path != output_path:
+                    if os.path.exists(output_path):
+                        os.remove(output_path)
+                    os.rename(result_path, output_path)
+                    result_path = output_path
+                
+                return {
+                    "success": True,
+                    "message": f"Successfully changed background color to {color} with {opacity*100}% opacity",
+                    "result_path": result_path,
+                    "modified_file": result_path
+                }
+                
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Error changing background color: {str(e)}",
+                    "result_path": None
+                }
             
         except Exception as e:
-            return f"Error changing background color: {str(e)}"
+            import traceback
+            error_details = traceback.format_exc()
+            return f"Error changing background color: {str(e)}\n\nDetails:\n{error_details}"
 
 class MergePDFsInput(BaseModel):
     pdf_paths: List[str] = Field(description="List of PDF file paths to merge")
@@ -285,13 +353,62 @@ class AnalyzePDFTool(BaseTool):
     description: str = "Comprehensive PDF analysis including structure, fonts, formatting, and content"
     args_schema: Type[BaseModel] = AnalyzePDFInput
     
-    def _run(self, pdf_path: str) -> str:
+    def _run(self, *args, **kwargs) -> str:
         try:
+            # Handle both direct arguments and dictionary input
+            if len(args) == 1 and isinstance(args[0], str):
+                # If a single string is provided, treat it as the file path
+                pdf_path = args[0]
+            elif len(args) > 1:
+                # If multiple args, assume they're in order: pdf_path
+                pdf_path = args[0]
+            else:
+                # Use kwargs
+                pdf_path = kwargs.get('pdf_path')
+            
+            if not pdf_path:
+                return "Error: No PDF path provided. Please provide a valid path to the PDF file."
+                
+            if isinstance(pdf_path, dict):
+                # Handle case where input is a JSON string that was parsed to dict
+                pdf_path = pdf_path.get('pdf_path')
+                if not pdf_path:
+                    return "Error: Invalid input format. Expected 'pdf_path' in the input."
+            
+            # Clean up the input path if it's wrapped in quotes or has extra spaces
+            pdf_path = str(pdf_path).strip('\'"').strip()
+            
+            # Check if file exists
+            if not os.path.exists(pdf_path):
+                return f"Error: File not found: {pdf_path}"
+            
+            # Process the PDF
             pdf_processor = PDFProcessor()
             analysis = pdf_processor.analyze_document(pdf_path)
-            return json.dumps(analysis, indent=2)
+            
+            # Format the output for better readability
+            formatted_analysis = {
+                "page_count": analysis.get("pages", 0),
+                "fonts_used": analysis.get("fonts_used", []),
+                "colors_used": analysis.get("colors_used", []),
+                "has_images": analysis.get("has_images", False),
+                "has_tables": analysis.get("has_tables", False),
+                "headings": [
+                    {
+                        "text": h.get("text", "")[:100] + ("..." if len(h.get("text", "")) > 100 else ""),
+                        "page": h.get("page", 0),
+                        "font_size": h.get("size", 0)
+                    }
+                    for h in analysis.get("headings", [])[:10]  # Limit to first 10 headings
+                ]
+            }
+            
+            return json.dumps(formatted_analysis, indent=2)
+            
         except Exception as e:
-            return f"Error analyzing PDF: {str(e)}"
+            import traceback
+            error_details = traceback.format_exc()
+            return f"Error analyzing PDF: {str(e)}\n\nDetails:\n{error_details}"
 
 class ExtractTextTool(BaseTool):
     name: str = "extract_text"

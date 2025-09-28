@@ -3,7 +3,7 @@ from typing import Dict, Any, List, Optional
 from langchain.agents import create_react_agent, AgentExecutor
 from langchain.prompts import PromptTemplate
 from langchain.tools import Tool
-from langchain_community.llms import Ollama
+from langchain_groq import ChatGroq
 from langchain.schema import AgentAction, AgentFinish
 from langchain.callbacks.base import BaseCallbackHandler
 from dotenv import load_dotenv
@@ -18,14 +18,12 @@ class DocumentAgent:
     def __init__(self, websocket_manager=None):
         self.pdf_processor = PDFProcessor()
         self.websocket_manager = websocket_manager
-        # Initialize Ollama with TinyLlama for better memory efficiency
-        self.llm = Ollama(
-            model="llama3:8b",  # Using TinyLlama for better memory efficiency
-            temperature=0.1,
-            num_ctx=1024,
-            num_thread=4  # Adjust based on your CPU cores
+        # Initialize Groq with the latest Llama 4 model
+        self.llm = ChatGroq(
+            groq_api_key=os.getenv("GROQ_API_KEY"),
+            model_name="meta-llama/llama-4-scout-17b-16e-instruct",
+            temperature=0.1
         )
-        # self.llm=ChatGoogleGenerativeAI(temperature=0.0,model="gemini-1.5-flash")
         # Use comprehensive tool collection with all 23 PDF manipulation tools
         self.tools = get_all_pdf_tools()
         self.tool_categories = get_tool_categories()
@@ -76,9 +74,21 @@ class DocumentAgent:
                     "message": "Finalizing changes..."
                 }, document_id)
             
+            # Extract result path from the agent's output if available
+            result_output = result.get("output", {})
+            if isinstance(result_output, str):
+                # If output is a string, use it as the message
+                result_message = result_output
+                result_path = document_path  # Fallback to original path
+            else:
+                # If output is a dict, extract message and path
+                result_message = result_output.get("message", "Command processed successfully")
+                result_path = result_output.get("result_path", result_output.get("modified_file", document_path))
+            
             return {
                 "success": True,
-                "result": result.get("output", "Command processed successfully"),
+                "result": result_message,
+                "result_path": result_path,
                 "document_path": document_path
             }
             
@@ -164,17 +174,21 @@ Question: {input}
 {agent_scratchpad}
 """)
         
+        # Create the ReAct agent with proper prompt variables
         agent = create_react_agent(
             llm=self.llm,
             tools=self.tools,
-            prompt=react_prompt
+            prompt=react_prompt.partial(
+                tools="\n".join([f"{tool.name}: {tool.description}" for tool in self.tools]),
+                tool_names=", ".join([tool.name for tool in self.tools])
+            )
         )
         
         return AgentExecutor(
             agent=agent,
             tools=self.tools,
             verbose=True,
-            max_iterations=15,  # Increased for complex operations
+            max_iterations=15,
             handle_parsing_errors=True,
             return_intermediate_steps=True
         )
@@ -204,17 +218,36 @@ Question: {input}
             # Execute the agent
             result = self.agent.invoke({"input": agent_input})
             
+            # Extract the result path from the agent's output
+            output = result["output"]
+            result_path = None
+            
+            # Try to find the result path in the output
+            if isinstance(output, dict):
+                result_path = output.get('result_path') or output.get('modified_file')
+            elif isinstance(output, str):
+                # Try to extract path from string output
+                import re
+                path_match = re.search(r'saved to:?\s*([^\s\n]+)', output, re.IGNORECASE)
+                if path_match and os.path.exists(path_match.group(1)):
+                    result_path = path_match.group(1)
+            
+            # If we have a result path, use it; otherwise use the original document path
+            final_path = result_path if result_path and os.path.exists(result_path) else document_path
+            
             # Send completion update
             if self.websocket_manager:
-                await self.websocket_manager.broadcast_to_document({
-                    "type": "agent_complete",
-                    "progress": 90,
-                    "message": "Modifications completed successfully!"
-                }, document_id)
+                await self.websocket_manager.send_manipulation_complete(
+                    document_id=document_id,
+                    operation="document_modification",
+                    result_path=final_path,
+                    preview_url=f"/api/temp-preview/{document_id}"
+                )
             
             return {
                 "success": True,
-                "result": result["output"],
+                "result": output,
+                "result_path": final_path,
                 "agent_steps": result.get("intermediate_steps", [])
             }
             

@@ -199,13 +199,20 @@ export default function DocumentViewer() {
         break;
         
       case 'manipulation_complete':
+      case 'agent_complete':
         setCurrentProgress(100);
         setIsProcessing(false);
         setHasUnsavedChanges(true);
         
-        if (message.preview_url) {
-          setPreviewUrl(`http://localhost:8000${message.preview_url}`);
-          setPdfUrl(`http://localhost:8000${message.preview_url}`);
+        // Handle both preview_url and result_path for backward compatibility
+        const previewUrl = message.preview_url || 
+                         (message.result_path ? `/api/temp-preview/${params.id}?t=${Date.now()}` : '');
+        
+        if (previewUrl) {
+          // Add timestamp to prevent caching
+          const urlWithTimestamp = `http://localhost:8000${previewUrl}${previewUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
+          setPreviewUrl(urlWithTimestamp);
+          setPdfUrl(urlWithTimestamp);
         }
         
         const completeMessage: ChatMessage = {
