@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef } from "react";
 import { supabase } from "../../../lib/supabase";
 import { useRouter, useParams } from "next/navigation";
-import { FileText, Send, ArrowLeft, User, LogOut, Settings, Maximize2, Minimize2 } from "lucide-react";
+import { FileText, Send, ArrowLeft, User, LogOut, Settings, Maximize2, Minimize2, Save, X, CheckCircle, AlertCircle, Loader } from "lucide-react";
 import { getInitialTheme, saveTheme } from "../../../lib/theme";
 
 interface Document {
@@ -12,14 +12,27 @@ interface Document {
   file_size: number;
   created_at: string;
   file_path: string;
+  file_url: string;
   user_id: string;
 }
 
 interface ChatMessage {
   id: string;
-  type: 'user' | 'ai';
+  type: 'user' | 'ai' | 'system';
   content: string;
   timestamp: Date;
+  status?: 'sending' | 'processing' | 'completed' | 'error';
+}
+
+interface WebSocketMessage {
+  type: string;
+  operation?: string;
+  progress?: number;
+  message?: string;
+  details?: any;
+  timestamp?: number;
+  preview_url?: string;
+  result_path?: string;
 }
 
 export default function DocumentViewer() {
@@ -32,9 +45,16 @@ export default function DocumentViewer() {
   const [inputMessage, setInputMessage] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isChatExpanded, setIsChatExpanded] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [currentProgress, setCurrentProgress] = useState(0);
+  const [currentOperation, setCurrentOperation] = useState('');
+  const [sessionInitialized, setSessionInitialized] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState('');
   const router = useRouter();
   const params = useParams();
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
 
   useEffect(() => {
     setIsDark(getInitialTheme());
@@ -86,6 +106,8 @@ export default function DocumentViewer() {
 
       if (urlData?.signedUrl) {
         setPdfUrl(urlData.signedUrl);
+        // Initialize session with backend
+        await initializeSession(data.id, urlData.signedUrl);
       }
     };
 
@@ -98,34 +120,232 @@ export default function DocumentViewer() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [chatMessages]);
 
+  useEffect(() => {
+    return () => {
+      // Cleanup WebSocket on unmount
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+    };
+  }, []);
+
   const handleSignOut = async () => {
     await supabase.auth.signOut();
   };
 
+  const initializeSession = async (documentId: string, originalUrl: string) => {
+    try {
+      const response = await fetch('http://localhost:8000/api/document/session/init', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          document_id: documentId,
+          original_url: originalUrl
+        })
+      });
+      
+      if (response.ok) {
+        setSessionInitialized(true);
+        // Connect WebSocket
+        connectWebSocket(documentId);
+      }
+    } catch (error) {
+      console.error('Failed to initialize session:', error);
+    }
+  };
+
+  const connectWebSocket = (documentId: string) => {
+    const ws = new WebSocket(`ws://localhost:8000/ws/document/${documentId}`);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+    };
+
+    ws.onmessage = (event) => {
+      const message: WebSocketMessage = JSON.parse(event.data);
+      handleWebSocketMessage(message);
+    };
+
+    ws.onclose = () => {
+      console.log('WebSocket disconnected');
+      // Attempt to reconnect after 3 seconds
+      setTimeout(() => connectWebSocket(documentId), 3000);
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+  };
+
+  const handleWebSocketMessage = (message: WebSocketMessage) => {
+    switch (message.type) {
+      case 'manipulation_progress':
+        setCurrentProgress(message.progress || 0);
+        setCurrentOperation(message.operation || '');
+        setIsProcessing(true);
+        
+        // Add system message to chat
+        const progressMessage: ChatMessage = {
+          id: Date.now().toString(),
+          type: 'system',
+          content: message.message || 'Processing...',
+          timestamp: new Date(),
+          status: 'processing'
+        };
+        setChatMessages(prev => [...prev, progressMessage]);
+        break;
+        
+      case 'manipulation_complete':
+        setCurrentProgress(100);
+        setIsProcessing(false);
+        setHasUnsavedChanges(true);
+        
+        if (message.preview_url) {
+          setPreviewUrl(`http://localhost:8000${message.preview_url}`);
+          setPdfUrl(`http://localhost:8000${message.preview_url}`);
+        }
+        
+        const completeMessage: ChatMessage = {
+          id: Date.now().toString(),
+          type: 'system',
+          content: message.message || 'Modification completed successfully',
+          timestamp: new Date(),
+          status: 'completed'
+        };
+        setChatMessages(prev => [...prev, completeMessage]);
+        break;
+        
+      case 'error':
+        setIsProcessing(false);
+        setCurrentProgress(0);
+        
+        const errorMessage: ChatMessage = {
+          id: Date.now().toString(),
+          type: 'system',
+          content: message.message || 'An error occurred',
+          timestamp: new Date(),
+          status: 'error'
+        };
+        setChatMessages(prev => [...prev, errorMessage]);
+        break;
+    }
+  };
+
   const handleSendMessage = async () => {
-    if (!inputMessage.trim()) return;
+    if (!inputMessage.trim() || !sessionInitialized || isProcessing) return;
 
     const newMessage: ChatMessage = {
       id: Date.now().toString(),
       type: 'user',
       content: inputMessage,
-      timestamp: new Date()
+      timestamp: new Date(),
+      status: 'sending'
     };
 
     setChatMessages(prev => [...prev, newMessage]);
+    const command = inputMessage;
     setInputMessage('');
+    setIsProcessing(true);
 
-    // TODO: Send to AI backend for processing
-    // For now, add a placeholder AI response
-    setTimeout(() => {
-      const aiResponse: ChatMessage = {
+    try {
+      const response = await fetch('http://localhost:8000/api/document/modify', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          document_id: document?.id,
+          command: command
+        })
+      });
+      
+      if (!response.ok) {
+        throw new Error('Failed to process command');
+      }
+      
+      // Update message status
+      setChatMessages(prev => prev.map(msg => 
+        msg.id === newMessage.id ? { ...msg, status: 'processing' } : msg
+      ));
+      
+    } catch (error) {
+      setIsProcessing(false);
+      setChatMessages(prev => prev.map(msg => 
+        msg.id === newMessage.id ? { ...msg, status: 'error' } : msg
+      ));
+      
+      const errorMessage: ChatMessage = {
         id: (Date.now() + 1).toString(),
-        type: 'ai',
-        content: 'I understand you want to modify the document. The AI backend will be integrated here to process your request and update the PDF in real-time.',
-        timestamp: new Date()
+        type: 'system',
+        content: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        timestamp: new Date(),
+        status: 'error'
       };
-      setChatMessages(prev => [...prev, aiResponse]);
-    }, 1000);
+      setChatMessages(prev => [...prev, errorMessage]);
+    }
+  };
+
+  const handleSaveChanges = async () => {
+    if (!document?.id || !hasUnsavedChanges) return;
+    
+    try {
+      const response = await fetch('http://localhost:8000/api/document/save', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          document_id: document.id
+        })
+      });
+      
+      if (response.ok) {
+        setHasUnsavedChanges(false);
+        const saveMessage: ChatMessage = {
+          id: Date.now().toString(),
+          type: 'system',
+          content: 'Document saved successfully!',
+          timestamp: new Date(),
+          status: 'completed'
+        };
+        setChatMessages(prev => [...prev, saveMessage]);
+      }
+    } catch (error) {
+      console.error('Failed to save changes:', error);
+    }
+  };
+
+  const handleDiscardChanges = async () => {
+    if (!document?.id) return;
+    
+    try {
+      const response = await fetch('http://localhost:8000/api/document/discard', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          document_id: document.id
+        })
+      });
+      
+      if (response.ok) {
+        setHasUnsavedChanges(false);
+        setPreviewUrl('');
+        // Reset to original PDF
+        const { data: urlData } = await supabase.storage
+          .from('documents')
+          .createSignedUrl(document.file_path, 3600);
+        if (urlData?.signedUrl) {
+          setPdfUrl(urlData.signedUrl);
+        }
+      }
+    } catch (error) {
+      console.error('Failed to discard changes:', error);
+    }
   };
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
@@ -189,6 +409,37 @@ export default function DocumentViewer() {
             </div>
             
             <div className="flex items-center space-x-4">
+              {/* Save/Discard buttons */}
+              {hasUnsavedChanges && (
+                <div className="flex items-center space-x-2">
+                  <button
+                    onClick={handleSaveChanges}
+                    className="flex items-center space-x-2 px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                    title="Save changes"
+                  >
+                    <Save className="w-4 h-4" />
+                    <span className="text-sm">Save</span>
+                  </button>
+                  <button
+                    onClick={handleDiscardChanges}
+                    className="flex items-center space-x-2 px-3 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 transition-colors"
+                    title="Discard changes"
+                  >
+                    <X className="w-4 h-4" />
+                    <span className="text-sm">Discard</span>
+                  </button>
+                </div>
+              )}
+              
+              {/* Processing indicator */}
+              {isProcessing && (
+                <div className="flex items-center space-x-2 px-3 py-2 bg-blue-600 text-white rounded-lg">
+                  <Loader className="w-4 h-4 animate-spin" />
+                  <span className="text-sm">{currentOperation || 'Processing...'}</span>
+                  <span className="text-sm">({currentProgress}%)</span>
+                </div>
+              )}
+              
               <button
                 onClick={() => setIsFullscreen(!isFullscreen)}
                 className={`p-2 rounded-lg transition-colors ${isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-gray-200 hover:bg-gray-300 text-gray-600'}`}
@@ -276,16 +527,45 @@ export default function DocumentViewer() {
                   <div className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
                     message.type === 'user' 
                       ? 'bg-blue-600 text-white' 
+                      : message.type === 'system'
+                      ? message.status === 'error'
+                        ? 'bg-red-100 text-red-800 border border-red-200'
+                        : message.status === 'completed'
+                        ? 'bg-green-100 text-green-800 border border-green-200'
+                        : 'bg-yellow-100 text-yellow-800 border border-yellow-200'
                       : isDark ? 'bg-gray-700 text-gray-100' : 'bg-white text-gray-900 border border-gray-200'
                   }`}>
-                    <p className="text-sm">{message.content}</p>
-                    <p className={`text-xs mt-1 ${
-                      message.type === 'user' 
-                        ? 'text-blue-100' 
-                        : isDark ? 'text-gray-400' : 'text-gray-500'
-                    }`}>
-                      {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </p>
+                    <div className="flex items-start space-x-2">
+                      {message.type === 'system' && (
+                        <div className="flex-shrink-0 mt-0.5">
+                          {message.status === 'error' && <AlertCircle className="w-4 h-4" />}
+                          {message.status === 'completed' && <CheckCircle className="w-4 h-4" />}
+                          {message.status === 'processing' && <Loader className="w-4 h-4 animate-spin" />}
+                        </div>
+                      )}
+                      <div className="flex-1">
+                        <p className="text-sm">{message.content}</p>
+                        <div className="flex items-center justify-between mt-1">
+                          <p className={`text-xs ${
+                            message.type === 'user' 
+                              ? 'text-blue-100' 
+                              : message.type === 'system'
+                              ? 'text-current opacity-70'
+                              : isDark ? 'text-gray-400' : 'text-gray-500'
+                          }`}>
+                            {message.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                          {message.status && message.type === 'user' && (
+                            <div className="flex items-center space-x-1">
+                              {message.status === 'sending' && <Loader className="w-3 h-3 animate-spin text-blue-200" />}
+                              {message.status === 'processing' && <Loader className="w-3 h-3 animate-spin text-blue-200" />}
+                              {message.status === 'completed' && <CheckCircle className="w-3 h-3 text-blue-200" />}
+                              {message.status === 'error' && <AlertCircle className="w-3 h-3 text-red-200" />}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               ))
@@ -310,10 +590,11 @@ export default function DocumentViewer() {
               />
               <button
                 onClick={handleSendMessage}
-                disabled={!inputMessage.trim()}
+                disabled={!inputMessage.trim() || !sessionInitialized || isProcessing}
                 className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                title={!sessionInitialized ? "Initializing session..." : isProcessing ? "Processing..." : "Send message"}
               >
-                <Send className="w-4 h-4" />
+                {isProcessing ? <Loader className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
               </button>
             </div>
           </div>
