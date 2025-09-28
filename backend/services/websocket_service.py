@@ -97,17 +97,70 @@ class ConnectionManager:
         }, document_id)
     
     async def send_manipulation_complete(self, document_id: str, operation: str, 
-                                       result_path: str, preview_url: str):
-        """Send manipulation completion notification"""
-        await self.broadcast_to_document({
-            "type": "manipulation_complete",
-            "operation": operation,
-            "progress": 100,
-            "message": f"{operation} completed successfully",
-            "result_path": result_path,
-            "preview_url": preview_url,
-            "timestamp": asyncio.get_event_loop().time()
-        }, document_id)
+                                   result_path: str, preview_url: str = None):
+        """FIXED: Send manipulation completion notification"""
+        try:
+            # Verify the result path exists
+            import os
+            if not result_path or not os.path.exists(result_path):
+                await self.send_error(
+                    document_id, 
+                    f"Result file not found: {result_path}", 
+                    operation
+                )
+                return
+            
+            # Get file info
+            file_size = os.path.getsize(result_path)
+            if file_size == 0:
+                await self.send_error(
+                    document_id, 
+                    f"Result file is empty: {result_path}", 
+                    operation
+                )
+                return
+            
+            # Update temp storage with the new file path
+            try:
+                from utils.temp_storage import temp_storage
+                temp_storage.update_session(document_id, result_path, operation)
+            except Exception as storage_error:
+                logger.warning(f"Failed to update session storage: {storage_error}")
+            
+            # Create proper preview URL
+            final_preview_url = preview_url or f"/api/temp-preview/{document_id}"
+            
+            # Prepare completion message
+            message = {
+                "type": "manipulation_complete",
+                "operation": operation,
+                "progress": 100,
+                "message": f"{operation.replace('_', ' ').title()} completed successfully",
+                "result_path": result_path,
+                "preview_url": final_preview_url,
+                "modified_file": final_preview_url,  # For frontend compatibility
+                "success": True,
+                "file_size": file_size,
+                "timestamp": asyncio.get_event_loop().time()
+            }
+            
+            # Broadcast to all connected clients
+            await self.broadcast_to_document(message, document_id)
+            logger.info(f"Successfully sent completion for {operation} on document {document_id}")
+            
+        except Exception as e:
+            logger.error(f"Error in send_manipulation_complete: {str(e)}")
+            # Don't create infinite recursion - send a simple error message
+            try:
+                await self.broadcast_to_document({
+                    "type": "error",
+                    "operation": operation,
+                    "message": f"Error completing {operation}: {str(e)}",
+                    "success": False,
+                    "timestamp": asyncio.get_event_loop().time()
+                }, document_id)
+            except:
+                pass  # Prevent further errors
     
     async def send_error(self, document_id: str, error_message: str, operation: Optional[str] = None):
         """Send error notification"""

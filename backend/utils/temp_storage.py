@@ -3,6 +3,9 @@ import os
 import shutil
 from typing import Dict, Optional
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class TempStorageManager:
     def __init__(self):
@@ -32,15 +35,44 @@ class TempStorageManager:
         """Get session information"""
         return self.sessions.get(document_id)
     
-    def update_session(self, document_id: str, new_file_path: str, modification: str):
-        """Update session with new modification"""
-        if document_id in self.sessions:
-            # Replace working copy with modified version
-            session = self.sessions[document_id]
-            shutil.copy2(new_file_path, session["temp_file_path"])
-            
-            session["modifications"].append(modification)
-            session["is_modified"] = True
+    def update_session(self, document_id: str, new_file_path: str, operation: str):
+        """Update session with new file path and copy file to session directory"""
+        if document_id not in self.sessions:
+            return False
+        
+        session = self.sessions[document_id]
+        session_dir = os.path.dirname(session["temp_file_path"])
+        
+        # Copy the new file to the session directory with expected name
+        session_file_path = os.path.join(session_dir, "working_copy.pdf")
+        
+        try:
+            # Check if source and destination are the same file
+            if os.path.exists(new_file_path):
+                if os.path.samefile(new_file_path, session_file_path):
+                    # Files are the same, no need to copy, just update session info
+                    logger.info(f"Source and destination are the same file: {new_file_path}")
+                else:
+                    # Files are different, copy the new file
+                    shutil.copy2(new_file_path, session_file_path)
+                    logger.info(f"Copied {new_file_path} to {session_file_path}")
+                
+                # Update session info
+                session["temp_file_path"] = session_file_path
+                session["is_modified"] = True
+                session["last_operation"] = operation
+                session["modifications"].append({
+                    "operation": operation,
+                    "timestamp": time.time(),
+                    "file_path": session_file_path
+                })
+                
+                return True
+        except Exception as e:
+            print(f"Error updating session: {e}")
+            return False
+        
+        return False
     
     def cleanup_session(self, document_id: str):
         """Clean up temporary files for a session"""

@@ -1,6 +1,9 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import List, Optional, Dict, Any
 from enum import Enum
+import json
+
+
 class CommandType(str, Enum):
     # Text Operations
     REPLACE_TEXT = "replace_text"
@@ -47,10 +50,26 @@ class CommandType(str, Enum):
     ADD_WATERMARK = "add_watermark"
     HIGHLIGHT_TEXT = "highlight_text"
     ADD_ANNOTATION = "add_annotation"
+
+
+# ✅ Base model with reusable validator
+class ParametersModel(BaseModel):
+    @field_validator("parameters", mode="before", check_fields=False)
+    def parse_parameters(cls, v):
+        """Ensure parameters can be passed as JSON string or dict"""
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except Exception:
+                raise ValueError(f"Invalid parameters JSON: {v}")
+        return v
+
+
 class ModificationRequest(BaseModel):
     document_id: str
     command: str
     user_id: Optional[str] = None
+
 
 class ModificationResponse(BaseModel):
     status: str
@@ -58,6 +77,7 @@ class ModificationResponse(BaseModel):
     progress: int = 0
     message: str
     changes: List[str] = []
+
 
 class DocumentSession(BaseModel):
     document_id: str
@@ -67,14 +87,16 @@ class DocumentSession(BaseModel):
     modifications: List[str] = []
     is_modified: bool = False
 
-class DocumentModification(BaseModel):
+
+class DocumentModification(ParametersModel):
     action_type: CommandType
     parameters: Dict[str, Any]
     description: str
     timestamp: Optional[str] = None
     status: str = "pending"
 
-class AgentAction(BaseModel):
+
+class AgentAction(ParametersModel):
     action_type: CommandType
     parameters: Dict[str, Any]
     description: str

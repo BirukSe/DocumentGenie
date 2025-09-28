@@ -93,9 +93,9 @@ class RemoveTextInput(BaseModel):
     page_numbers: Optional[List[int]] = Field(default=None, description="Specific pages to modify (optional)")
 
 class ChangeTitleInput(BaseModel):
+    pdf_path: str = Field(description="Path to the PDF file")
     current_title: str = Field(description="Current title text to be replaced")
     new_title: str = Field(description="New title text to replace with")
-    pdf_path: Optional[str] = Field(default=None, description="Path to the PDF file (optional)")
     
     @classmethod
     def parse_raw(cls, raw: str, **kwargs):
@@ -122,6 +122,7 @@ class ChangeTitleInput(BaseModel):
         quoted_matches = re.findall(r'["\'](.*?)["\']', raw)
         if len(quoted_matches) >= 2:
             return cls(
+                pdf_path=kwargs.get('pdf_path', ''),
                 current_title=quoted_matches[0].strip(),
                 new_title=quoted_matches[1].strip()
             )
@@ -132,6 +133,7 @@ class ChangeTitleInput(BaseModel):
                 parts = [p.strip('\'" ') for p in raw.split(sep, 1)]
                 if len(parts) == 2:
                     return cls(
+                        pdf_path=kwargs.get('pdf_path', ''),
                         current_title=parts[0],
                         new_title=parts[1]
                     )
@@ -140,6 +142,7 @@ class ChangeTitleInput(BaseModel):
         parts = raw.split()
         if len(parts) >= 2:
             return cls(
+                pdf_path=kwargs.get('pdf_path', ''),
                 current_title=parts[0],
                 new_title=' '.join(parts[1:])
             )
@@ -197,151 +200,307 @@ class SplitPDFInput(BaseModel):
     pdf_path: str = Field(description="Path to the PDF file")
     split_points: List[int] = Field(description="Page numbers where to split the document")
 
+import os
+import json
+import logging
+from langchain.tools import BaseTool
+from typing import Type, Dict, Any
+from pydantic import BaseModel, Field
+
+# Set up logging
+logger = logging.getLogger(__name__)
+
 class ChangeBackgroundColorInput(BaseModel):
-    file_path: str = Field(default=None, description="Path to the PDF file")
-    pdf_path: str = Field(default=None, description="[Deprecated] Use file_path instead. Path to the PDF file")
-    color: str = Field(default="yellow", 
-                     description="Background color in hex format (e.g., '#FFFF00' for yellow) or color name (e.g., 'yellow')")
-    opacity: float = Field(default=1.0, ge=0.0, le=1.0, 
-                         description="Opacity of the background color (0.0 to 1.0, default: 1.0)")
-    
-    class Config:
-        extra = "allow"  # Allow extra fields to be passed
+    pdf_path: str = Field(description="Path to the PDF file")
+    color: str = Field(default="yellow", description="Background color (hex or color name)")
+    opacity: float = Field(default=0.7, description="Opacity (0.0 to 1.0)")
 
 class ChangeBackgroundColorTool(BaseTool):
     name: str = "change_background_color"
-    description: str = "Change the background color of all pages in the PDF"
+    description: str = "Change the background color of all pages in the PDF document"
     args_schema: Type[BaseModel] = ChangeBackgroundColorInput
     
-    def _run(self, *args, **kwargs) -> str:
+    def _run(self, pdf_path: str, color: str = "yellow", opacity: float = 0.7, **kwargs) -> str:
         """
         Change the background color of all pages in the PDF.
-        
-        Args:
-            pdf_path: Path to the PDF file (deprecated, use file_path instead)
-            file_path: Path to the PDF file
-            color: Background color in hex format (e.g., '#FFFF00' for yellow) or color name (e.g., 'yellow')
-            opacity: Opacity of the background color (0.0 to 1.0, default: 0.3)
-            
-        Returns:
-            str: Path to the modified PDF file or error message
+        FIXED: Proper JSON input parsing from LangChain agent.
         """
         try:
-            # Handle JSON string input (common from API calls)
-            if len(args) == 1 and isinstance(args[0], str) and args[0].startswith('{') and args[0].endswith('}'):
-                import json
+            logger.info(f"ChangeBackgroundColorTool called with: pdf_path={pdf_path}, color={color}, opacity={opacity}")
+            
+            # CRITICAL FIX: Handle JSON string input from agent
+            actual_pdf_path = pdf_path
+            actual_color = color
+            actual_opacity = opacity
+            
+            # If pdf_path is a JSON string (from agent), parse it
+            if isinstance(pdf_path, str) and pdf_path.strip().startswith('{'):
                 try:
-                    input_data = json.loads(args[0])
-                    kwargs.update(input_data)
-                    args = []
-                except json.JSONDecodeError:
-                    pass
+                    import json
+                    parsed_data = json.loads(pdf_path.strip())
+                    actual_pdf_path = parsed_data.get('pdf_path', '')
+                    actual_color = parsed_data.get('color', color)
+                    actual_opacity = float(parsed_data.get('opacity', opacity))
+                    logger.info(f"Parsed JSON input: path={actual_pdf_path}, color={actual_color}, opacity={actual_opacity}")
+                except (json.JSONDecodeError, ValueError, KeyError) as e:
+                    logger.error(f"Failed to parse JSON input: {e}")
+                    return f"Error: Invalid JSON input format: {pdf_path}"
             
-            # Handle both direct arguments and dictionary input
-            if len(args) == 1 and isinstance(args[0], str):
-                # If a single string is provided, treat it as the file path
-                input_path = args[0]
-                color = 'yellow'  # Default color
-                opacity = 0.3     # Default opacity
-            elif len(args) > 1:
-                # If multiple args, assume they're in order: file_path, color, opacity
-                input_path = args[0]
-                color = args[1] if len(args) > 1 else 'yellow'
-                try:
-                    opacity = float(args[2]) if len(args) > 2 else 0.3
-                except (ValueError, TypeError):
-                    opacity = 0.3
-            else:
-                # Use kwargs
-                input_path = kwargs.get('file_path') or kwargs.get('pdf_path')
-                color = kwargs.get('color', 'yellow')
-                try:
-                    opacity = float(kwargs.get('opacity', 0.3))
-                except (ValueError, TypeError):
-                    opacity = 0.3
+            # Validate inputs
+            if not actual_pdf_path:
+                return "Error: No PDF path provided."
             
-            if not input_path:
-                return "Error: No file path provided. Please provide either file_path or pdf_path."
-                
-            # If input_path is a dict (from JSON input), extract the path
-            if isinstance(input_path, dict):
-                input_path = input_path.get('file_path') or input_path.get('pdf_path')
-                if not input_path:
-                    return "Error: Invalid input format. Expected file_path or pdf_path in the input."
+            # Clean up path
+            actual_pdf_path = str(actual_pdf_path).strip('\'"')
             
-            # Clean up the input path if it's wrapped in quotes or has extra spaces
-            input_path = str(input_path).strip('"\'').strip()
+            # Validate file exists
+            if not os.path.exists(actual_pdf_path):
+                logger.error(f"PDF file not found: {actual_pdf_path}")
+                return f"Error: PDF file not found: {actual_pdf_path}"
             
-            # Ensure the file exists
-            if not os.path.exists(input_path):
-                return f"Error: File not found: {input_path}"
-                
-            # Validate color format
-            if not color.startswith('#'):
-                # Try to convert color name to hex
-                try:
-                    import webcolors
-                    color = webcolors.name_to_hex(color)
-                except (ValueError, AttributeError):
-                    # If not a named color, assume it's a hex code without #
-                    if not color.startswith('#'):
-                        color = f"#{color}"
-            
-            # Ensure opacity is between 0 and 1
+            # Validate opacity range
             try:
-                opacity = float(opacity)
-                opacity = max(0.0, min(1.0, opacity))
+                actual_opacity = float(actual_opacity)
+                if not (0.0 <= actual_opacity <= 1.0):
+                    actual_opacity = max(0.0, min(1.0, actual_opacity))  # Clamp to valid range
             except (ValueError, TypeError):
-                opacity = 0.3
+                actual_opacity = 0.3  # Default fallback
             
-            # Create output path in the same directory as the input file
-            input_dir = os.path.dirname(input_path)
-            input_filename = os.path.basename(input_path)
-            output_filename = f"bg_{input_filename}"
-            output_path = os.path.join(input_dir, output_filename)
+            # Import PDFProcessor
+            if PDFProcessor is None:
+                return "Error: PDFProcessor service not available"
             
-            try:
-                # Use the PDFProcessor to handle the background color change
-                pdf_processor = PDFProcessor()
-                result_path = pdf_processor.change_background_color(
-                    input_path=input_path,
-                    color=color,
-                    opacity=opacity
-                )
-                
-                # Verify the result
-                if not result_path or not os.path.exists(result_path):
-                    return {
-                        "success": False,
-                        "error": f"Failed to generate output file at {result_path}",
-                        "result_path": None
-                    }
-                
-                # If the result_path is different from our expected output_path, rename it
-                if result_path != output_path:
-                    if os.path.exists(output_path):
-                        os.remove(output_path)
-                    os.rename(result_path, output_path)
-                    result_path = output_path
-                
-                return {
-                    "success": True,
-                    "message": f"Successfully changed background color to {color} with {opacity*100}% opacity",
-                    "result_path": result_path,
-                    "modified_file": result_path
-                }
-                
-            except Exception as e:
-                return {
-                    "success": False,
-                    "error": f"Error changing background color: {str(e)}",
-                    "result_path": None
-                }
+            # Use PDFProcessor to change background color
+            processor = PDFProcessor()
             
+            logger.info(f"Processing background color change: file={actual_pdf_path}, color={actual_color}, opacity={actual_opacity}")
+            
+            result = processor.change_background_color(
+                input_path=actual_pdf_path,
+                color=actual_color,
+                opacity=actual_opacity
+            )
+            
+            if result.get('success'):
+                success_msg = f"Successfully changed background color to {actual_color} with {actual_opacity*100:.1f}% opacity. Modified document saved to: {result['output_path']}"
+                logger.info(success_msg)
+                return success_msg
+            else:
+                error_msg = f"Failed to change background color: {result.get('error', 'Unknown error')}"
+                logger.error(error_msg)
+                return error_msg
+                
         except Exception as e:
             import traceback
-            error_details = traceback.format_exc()
-            return f"Error changing background color: {str(e)}\n\nDetails:\n{error_details}"
+            error_msg = f"Tool execution error: {str(e)}"
+            logger.error(f"{error_msg}\n{traceback.format_exc()}")
+            return error_msg
+    
+    async def _arun(self, pdf_path: str, color: str = "yellow", opacity: float = 0.7, **kwargs) -> str:
+        """Async version"""
+        return self._run(pdf_path, color, opacity, **kwargs)
+# class ChangeBackgroundColorTool(BaseTool):
+#     name: str = "change_background_color"
+#     description: str = "Change the background color of all pages in the PDF"
+#     args_schema: Type[BaseModel] = ChangeBackgroundColorInput
+    
+#     def _run(self, *args, **kwargs) -> Dict[str, Any]:
+#         """
+#         Change the background color of all pages in the PDF.
+        
+#         Args:
+#             pdf_path: Path to the PDF file (deprecated, use file_path instead)
+#             file_path: Path to the PDF file
+#             color: Background color in hex format (e.g., '#FFFF00' for yellow) or color name (e.g., 'yellow')
+#             opacity: Opacity of the background color (0.0 to 1.0, default: 0.3)
+            
+#         Returns:
+#             Dict with success status, message, and result path
+#         """
+#         try:
+#             # Handle JSON string input (common from API calls)
+#             if len(args) == 1 and isinstance(args[0], str) and args[0].startswith('{') and args[0].endswith('}'):
+#                 import json
+#                 try:
+#                     input_data = json.loads(args[0])
+#                     kwargs.update(input_data)
+#                     args = []
+#                 except json.JSONDecodeError:
+#                     pass
+            
+#             # Handle direct command string (e.g., "change the background color to yellow")
+#             if len(args) == 1 and isinstance(args[0], str) and ' ' in args[0]:
+#                 # Extract color from command if possible
+#                 cmd = args[0].lower()
+#                 color = 'yellow'  # default
+#                 if 'yellow' in cmd:
+#                     color = 'yellow'
+#                 elif 'red' in cmd:
+#                     color = 'red'
+#                 elif 'blue' in cmd:
+#                     color = 'blue'
+#                 elif 'green' in cmd:
+#                     color = 'green'
+#                 # Extract opacity if mentioned
+#                 if 'opacity' in cmd or 'transparent' in cmd:
+#                     opacity = 0.3  # default opacity
+#                 else:
+#                     opacity = 1.0  # full opacity if not specified
+                
+#                 # Try to get the file path from kwargs or use the command as path
+#                 input_path = kwargs.get('file_path') or kwargs.get('pdf_path') or args[0]
+#             # Handle direct arguments
+#             elif len(args) > 0:
+#                 input_path = args[0]
+#                 color = args[1] if len(args) > 1 else 'yellow'
+#                 try:
+#                     opacity = float(args[2]) if len(args) > 2 else 0.3
+#                 except (ValueError, TypeError):
+#                     opacity = 0.3
+#             else:
+#                 # Handle kwargs
+#                 input_path = kwargs.get('file_path') or kwargs.get('pdf_path')
+#                 color = kwargs.get('color', 'yellow')
+#                 try:
+#                     opacity = float(kwargs.get('opacity', 0.3))
+#                 except (ValueError, TypeError):
+#                     opacity = 0.3
+                    
+#             # If we still don't have an input path, return an error
+#             if not input_path:
+#                 return {
+#                     "success": False,
+#                     "error": "No file path provided. Please provide either file_path or pdf_path.",
+#                     "result_path": None,
+#                     "modified_file": None
+#                 }
+            
+#             # If input_path is a dict (from JSON input), extract the path
+#             if isinstance(input_path, dict):
+#                 input_path = input_path.get('file_path') or input_path.get('pdf_path')
+#                 if not input_path:
+#                     return "Error: Invalid input format. Expected file_path or pdf_path in the input."
+            
+#             # Clean up the input path if it's wrapped in quotes or has extra spaces
+#             input_path = str(input_path).strip('"\'').strip()
+            
+#             # Ensure the file exists
+#             if not os.path.exists(input_path):
+#                 return {
+#                     "success": False,
+#                     "error": f"Input file not found: {input_path}",
+#                     "result_path": None,
+#                     "modified_file": None
+#                 }
+                
+#             # Convert color name to hex if needed
+#             color_mapping = {
+#                 'yellow': '#FFFF00',
+#                 'red': '#FF0000',
+#                 'blue': '#0000FF',
+#                 'green': '#00FF00',
+#                 'white': '#FFFFFF',
+#                 'black': '#000000'
+#             }
+            
+#             # Convert color name to hex if it's a named color
+#             color = color_mapping.get(color.lower(), color)
+            
+#             # Convert color name to hex if it's a named color, or ensure it starts with #
+#             color_mapping = {
+#                 'yellow': '#FFFF00',
+#                 'red': '#FF0000',
+#                 'blue': '#0000FF',
+#                 'green': '#00FF00',
+#                 'white': '#FFFFFF',
+#                 'black': '#000000',
+#                 'gray': '#808080',
+#                 'grey': '#808080',
+#                 'cyan': '#00FFFF',
+#                 'magenta': '#FF00FF'
+#             }
+            
+#             # Convert color name to hex if it's a named color
+#             color = color_mapping.get(color.lower(), color)
+            
+#             # Ensure color starts with # if it's a hex color
+#             if not color.startswith('#') and all(c in '0123456789ABCDEFabcdef' for c in color):
+#                 color = f"#{color}"
+            
+#             # Ensure opacity is between 0 and 1
+#             try:
+#                 opacity = float(opacity)
+#                 if opacity < 0 or opacity > 1:
+#                     return {
+#                         "success": False,
+#                         "error": "Opacity must be between 0.0 and 1.0",
+#                         "result_path": None,
+#                         "modified_file": None
+#                     }
+#             except (ValueError, TypeError):
+#                 return {
+#                     "success": False,
+#                     "error": "Opacity must be a number between 0.0 and 1.0",
+#                     "result_path": None,
+#                     "modified_file": None
+#                 }
+            
+#             try:
+#                 # Use the PDFProcessor to handle the background color change
+#                 pdf_processor = PDFProcessor()
+                
+#                 # Process the file with the PDF processor
+#                 result = pdf_processor.change_background_color(
+#                     input_path=input_path,
+#                     color=color,
+#                     opacity=opacity
+#                 )
+                
+#                 # Verify the result
+#                 if not result or 'output_path' not in result or not os.path.exists(result['output_path']):
+#                     error_msg = f"Failed to generate output file: {result.get('error', 'Unknown error')}" if isinstance(result, dict) else "Unknown error"
+#                     return {
+#                         "success": False,
+#                         "error": error_msg,
+#                         "result_path": None,
+#                         "modified_file": None,
+#                         "preview_url": None
+#                     }
+                    
+#                 # Verify the output file is not empty
+#                 if os.path.getsize(result['output_path']) == 0:
+#                     return {
+#                         "success": False,
+#                         "error": "Generated output file is empty",
+#                         "result_path": None,
+#                         "modified_file": None,
+#                         "preview_url": None
+#                     }
+                    
+#                 # Ensure the web server can access the file
+#                 web_accessible_path = f"/api/temp-preview/{os.path.basename(result['output_path'])}"
+                
+#                 return {
+#                     "success": True,
+#                     "message": f"Successfully changed background color to {color} with {opacity*100}% opacity",
+#                     "result_path": result['output_path'],
+#                     "modified_file": web_accessible_path,
+#                     "preview_url": web_accessible_path
+#                 }
+                
+#             except Exception as e:
+#                 import traceback
+#                 return {
+#                     "success": False,
+#                     "error": f"Error changing background color: {str(e)}\n{traceback.format_exc()}",
+#                     "result_path": None,
+#                     "modified_file": None
+#                 }
+            
+#         except Exception as e:
+#             import traceback
+#             error_details = traceback.format_exc()
+#             return f"Error changing background color: {str(e)}\n\nDetails:\n{error_details}"
 
 class MergePDFsInput(BaseModel):
     pdf_paths: List[str] = Field(description="List of PDF file paths to merge")
@@ -444,16 +603,66 @@ class ReplaceTextTool(BaseTool):
     description: str = "Replace specific text in the PDF document with font style preservation and fuzzy matching"
     args_schema: Type[BaseModel] = ReplaceTextInput
     
-    def _run(self, pdf_path: str, old_text: str, new_text: str, preserve_formatting: bool = True, 
-             fuzzy_match: bool = True, page_numbers: Optional[List[int]] = None) -> str:
+    def _run(self, *args, **kwargs) -> str:
+        """
+        Replace text in PDF document.
+        Handles both direct arguments and JSON input from the agent.
+        """
         try:
+            # Handle different input formats from the agent
+            if len(args) >= 3:
+                # Direct arguments: pdf_path, old_text, new_text
+                pdf_path = str(args[0])
+                old_text = str(args[1])
+                new_text = str(args[2])
+                preserve_formatting = bool(args[3]) if len(args) > 3 else True
+                fuzzy_match = bool(args[4]) if len(args) > 4 else True
+            elif len(args) == 1 and isinstance(args[0], str):
+                # JSON string input from agent
+                try:
+                    import json
+                    data = json.loads(args[0])
+                    pdf_path = str(data.get('pdf_path', ''))
+                    old_text = str(data.get('old_text', ''))
+                    new_text = str(data.get('new_text', ''))
+                    preserve_formatting = bool(data.get('preserve_formatting', True))
+                    fuzzy_match = bool(data.get('fuzzy_match', True))
+                except json.JSONDecodeError:
+                    return f"Error: Invalid JSON input format: {args[0]}"
+            else:
+                # Use kwargs
+                pdf_path = kwargs.get('pdf_path', '')
+                old_text = kwargs.get('old_text', '')
+                new_text = kwargs.get('new_text', '')
+                preserve_formatting = kwargs.get('preserve_formatting', True)
+                fuzzy_match = kwargs.get('fuzzy_match', True)
+            
+            # Validate inputs
+            if not pdf_path or not os.path.exists(pdf_path):
+                return f"Error: PDF file not found: {pdf_path}"
+            
+            if not old_text or not new_text:
+                return "Error: Both old text and new text are required"
+            
+            # Clean up inputs
+            old_text = old_text.strip('\'" ')
+            new_text = new_text.strip('\'" ')
+            
+            logger.info(f"ReplaceTextTool: pdf_path={pdf_path}, old_text='{old_text}', new_text='{new_text}'")
+            
+            # Initialize PDF processor
             pdf_processor = PDFProcessor()
+            
+            # Replace text with formatting preservation
             result_path = pdf_processor.replace_text_with_formatting(
                 pdf_path, old_text, new_text, preserve_formatting, fuzzy_match
             )
-            return f"Text replacement completed with font preservation. Modified document: {result_path}"
+            
+            return f"Successfully replaced '{old_text}' with '{new_text}'. Modified document: {result_path}"
+            
         except Exception as e:
-            return f"Error replacing text: {str(e)}"
+            import traceback
+            return f"Error in replace_text: {str(e)}\n{traceback.format_exc()}"
 
 class AddTextTool(BaseTool):
     name: str = "add_text"
@@ -492,135 +701,112 @@ class ChangeTitleTool(BaseTool):
     args_schema: Type[BaseModel] = ChangeTitleInput
     
     def _run(self, *args, **kwargs) -> str:
+        """
+        Change the title of a PDF document.
+        Handles both direct arguments and JSON input from the agent.
+        """
         doc = None
         try:
-            # Handle different input formats
-            if len(args) >= 2:
-                current_title = str(args[0])
-                new_title = str(args[1])
-                pdf_path = kwargs.get('pdf_path')
-            elif 'input' in kwargs:
-                input_str = str(kwargs['input']).strip()
+            # Handle different input formats from the agent
+            if len(args) >= 3:
+                # Direct arguments: pdf_path, current_title, new_title
+                pdf_path = str(args[0])
+                current_title = str(args[1])
+                new_title = str(args[2])
+            elif len(args) == 1 and isinstance(args[0], str):
+                # JSON string input from agent
                 try:
-                    if input_str.startswith('{') and input_str.endswith('}'):
-                        import json
-                        data = json.loads(input_str)
-                        current_title = str(data.get('current_title', '')).strip('\'" ')
-                        new_title = str(data.get('new_title', '')).strip('\'" ')
-                        pdf_path = data.get('pdf_path') or kwargs.get('pdf_path')
-                    else:
-                        parsed = self.args_schema.parse_raw(f'"{input_str}"')
-                        current_title = parsed.current_title
-                        new_title = parsed.new_title
-                        pdf_path = parsed.pdf_path or kwargs.get('pdf_path')
-                except Exception as e:
-                    error_msg = (
-                        f"Error parsing input: {str(e)}\n"
-                        "Please use one of these formats:\n"
-                        "1. change_title \"current\" \"new\"\n"
-                        "2. change_title 'current' to 'new'\n"
-                        "3. change_title 'current', 'new'\n"
-                        "4. change_title 'current' -> 'new'\n"
-                        '5. change_title {\"current_title\":\"current\",\"new_title\":\"new\"}'
-                    )
-                    return error_msg
+                    import json
+                    data = json.loads(args[0])
+                    pdf_path = str(data.get('pdf_path', ''))
+                    current_title = str(data.get('current_title', ''))
+                    new_title = str(data.get('new_title', ''))
+                except json.JSONDecodeError:
+                    return f"Error: Invalid JSON input format: {args[0]}"
             else:
-                return "Error: Please provide both current and new titles"
+                # Use kwargs
+                pdf_path = kwargs.get('pdf_path', '')
+                current_title = kwargs.get('current_title', '')
+                new_title = kwargs.get('new_title', '')
             
             # Validate inputs
-            current_title = current_title.strip('\'" ')
-            new_title = new_title.strip('\'" ')
+            if not pdf_path or not os.path.exists(pdf_path):
+                return f"Error: PDF file not found: {pdf_path}"
             
             if not current_title or not new_title:
                 return "Error: Both current title and new title are required"
-                
-            # Get the document path
-            document_path = pdf_path or kwargs.get('document_path')
-            if not document_path:
-                return "Error: Document path is required"
+            
+            # Clean up inputs
+            current_title = current_title.strip('\'" ')
+            new_title = new_title.strip('\'" ')
+            
+            logger.info(f"ChangeTitleTool: pdf_path={pdf_path}, current_title='{current_title}', new_title='{new_title}'")
             
             # Initialize PDF processor
             pdf_processor = PDFProcessor()
             
-            try:
-                # Load the document
-                doc = pdf_processor.load_document(document_path)
-                if not doc:
-                    return "Error: Failed to load document"
+            # Load the document
+            doc = pdf_processor.load_pdf(pdf_path)
+            if not doc:
+                return "Error: Failed to load document"
+            
+            # Search and replace text in each page
+            found = False
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text()
+                if current_title in text:
+                    found = True
+                    # Use replace_text_with_formatting for better results
+                    text_instances = page.search_for(current_title)
+                    for inst in text_instances:
+                        # Get original formatting
+                        original_formatting = pdf_processor._get_text_formatting(pdf_path, current_title)
+                        
+                        # Replace with new title using original formatting
+                        page.add_redact_annot(inst)
+                        page.apply_redactions()
+                        
+                        # Insert new text with preserved formatting
+                        page.insert_text(
+                            inst.tl,  # Top-left point
+                            new_title,
+                            fontname=original_formatting.get("font", "helv"),
+                            fontsize=original_formatting.get("size", 12),
+                            color=pdf_processor._convert_color_to_rgb(original_formatting.get("color", 0))
+                        )
+            
+            if not found:
+                # If title not found, try to identify it from the document structure
+                analysis = pdf_processor.analyze_document(pdf_path)
+                title_candidates = []
+                for block in analysis.get('text_blocks', []):
+                    if block.get('page_number') == 1:  # Look for title in first page
+                        title_candidates.append({
+                            'text': block.get('text', '').strip(),
+                            'size': block.get('size', 0),
+                            'bbox': block.get('bbox', (0, 0, 0, 0))
+                        })
                 
-                # Search and replace text in each page
-                found = False
-                for page in doc:
-                    text = page.get_text()
-                    if current_title in text:
-                        found = True
-                        text = text.replace(current_title, new_title)
-                        page.set_text(text)
+                if title_candidates:
+                    # Sort by size (largest first) and vertical position (top first)
+                    title_candidates.sort(key=lambda x: (-x['size'], x['bbox'][1]))
+                    detected_title = title_candidates[0]['text']
+                    return f"Error: Could not find title '{current_title}' in the document. Detected possible title: '{detected_title}'"
                 
-                if not found:
-                    # If title not found, try to identify it from the document structure
-                    analysis = pdf_processor.analyze_document(document_path)
-                    title_candidates = []
-                    for block in analysis.get('text_blocks', []):
-                        if block.get('page_number') == 1:  # Look for title in first page
-                            title_candidates.append({
-                                'text': block.get('text', '').strip(),
-                                'size': block.get('size', 0),
-                                'bbox': block.get('bbox', (0, 0, 0, 0))
-                            })
-                    
-                    if title_candidates:
-                        # Sort by size (largest first) and vertical position (top first)
-                        title_candidates.sort(key=lambda x: (-x['size'], x['bbox'][1]))
-                        current_title = title_candidates[0]['text']
-                        return self._update_title(document_path, current_title, new_title)
-                    
-                    return f"Error: Could not find title '{current_title}' in the document"
-                
-                # Save the document
-                output_path = kwargs.get('output_path', document_path)
-                doc.save(output_path)
-                return f"Successfully changed title from '{current_title}' to '{new_title}'"
-                
-            except Exception as e:
-                return f"Error processing document: {str(e)}"
+                return f"Error: Could not find title '{current_title}' in the document"
+            
+            # Save the document
+            doc.save(pdf_path, garbage=4, deflate=True)
+            return f"Successfully changed title from '{current_title}' to '{new_title}'"
                 
         except Exception as e:
-            return f"Error in change_title: {str(e)}"
+            import traceback
+            return f"Error in change_title: {str(e)}\n{traceback.format_exc()}"
             
         finally:
             if doc is not None:
                 doc.close()
-                
-    def _update_title(self, pdf_path: str, old_title: str, new_title: str) -> str:
-        """Internal method to handle the title update logic"""
-        try:
-            pdf_processor = PDFProcessor()
-            
-            # Use replace_text_with_formatting to update the title
-            result_path = pdf_processor.replace_text_with_formatting(
-                pdf_path=pdf_path,
-                old_text=old_title,
-                new_text=new_title,
-                preserve_formatting=True,
-                fuzzy_match=True
-            )
-            
-            # Verify the change was made
-            doc = fitz.open(result_path)
-            try:
-                page = doc[0]
-                text_instances = page.search_for(old_title, hit_max=1)
-                if text_instances:  # If old title is still found
-                    return f"Error: Failed to update the title. The text might be part of an image or vector graphic."
-                
-                return f"Successfully changed title from '{old_title}' to '{new_title}'. Modified document: {result_path}"
-            finally:
-                doc.close()
-                
-        except Exception as e:
-            import traceback
-            return f"Error updating title: {str(e)}\n{traceback.format_exc()}"
 
 class SwapPagesTool(BaseTool):
     name: str = "swap_pages"

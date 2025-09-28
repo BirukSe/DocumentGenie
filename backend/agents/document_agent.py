@@ -42,66 +42,96 @@ class DocumentAgent:
     async def process_command_async(self, document_path: str, command: str, document_id: str) -> Dict[str, Any]:
         """
         Process a document modification command asynchronously.
-        
-        Args:
-            document_path: Path to the document to modify
-            command: The modification command from the user
-            document_id: ID of the document being modified
-            
-        Returns:
-            Dictionary with the result of the operation
         """
         try:
             # Notify client that processing has started
             if self.websocket_manager:
-                await self.websocket_manager.broadcast_to_document({
-                    "type": "progress",
-                    "progress": 20,
-                    "message": f"Processing command: {command}"
-                }, document_id)
+                await self.websocket_manager.send_manipulation_progress(
+                    document_id, "processing_command", 20, f"Processing: {command}"
+                )
             
-            # Process the command using the agent
-            result = await self.agent.ainvoke({
-                "input": f"Document: {document_path}\nCommand: {command}",
-                "document_id": document_id
-            })
+            # Create a properly formatted input for the agent
+            agent_input = f"""
+            Document Path: {document_path}
+            User Command: {command}
+            Document ID: {document_id}
             
-            # Notify client of completion
-            if self.websocket_manager:
-                await self.websocket_manager.broadcast_to_document({
-                    "type": "progress",
-                    "progress": 90,
-                    "message": "Finalizing changes..."
-                }, document_id)
+            Please process this command using the appropriate tool. 
+            For background color changes, use the change_background_color tool.
+            Always include the document path when calling tools.
+            """
             
-            # Extract result path from the agent's output if available
-            result_output = result.get("output", {})
-            if isinstance(result_output, str):
-                # If output is a string, use it as the message
-                result_message = result_output
-                result_path = document_path  # Fallback to original path
-            else:
-                # If output is a dict, extract message and path
-                result_message = result_output.get("message", "Command processed successfully")
-                result_path = result_output.get("result_path", result_output.get("modified_file", document_path))
-            
-            return {
-                "success": True,
-                "result": result_message,
-                "result_path": result_path,
-                "document_path": document_path
-            }
-            
+            # Execute the agent with proper error handling
+            try:
+                result = await self.agent.ainvoke({
+                    "input": agent_input,
+                    "document_path": document_path,  # Provide document path in context
+                    "document_id": document_id
+                })
+                
+                # Extract result information
+                agent_output = result.get("output", "")
+                
+                # Try to extract result path from agent steps
+                result_path = document_path  # Default fallback
+                intermediate_steps = result.get("intermediate_steps", [])
+                
+                for step in intermediate_steps:
+                    if isinstance(step, tuple) and len(step) >= 2:
+                        action, observation = step
+                        if isinstance(observation, dict):
+                            if observation.get("success") and observation.get("result_path"):
+                                result_path = observation["result_path"]
+                                break
+                            elif observation.get("modified_file"):
+                                result_path = observation["modified_file"]
+                                break
+                        elif isinstance(observation, str) and "Modified document:" in observation:
+                            # Extract path from string observation
+                            import re
+                            path_match = re.search(r'Modified document: (.+)', observation)
+                            if path_match:
+                                potential_path = path_match.group(1).strip()
+                                if os.path.exists(potential_path):
+                                    result_path = potential_path
+                                    break
+                
+                # Notify completion
+                if self.websocket_manager:
+                    await self.websocket_manager.send_manipulation_complete(
+                        document_id=document_id,
+                        operation="document_modification",
+                        result_path=result_path,
+                        preview_url=f"/api/temp-preview/{document_id}"
+                    )
+                
+                return {
+                    "success": True,
+                    "result": agent_output,
+                    "result_path": result_path,
+                    "agent_steps": intermediate_steps
+                }
+                
+            except Exception as agent_error:
+                error_msg = f"Agent execution error: {str(agent_error)}"
+                if self.websocket_manager:
+                    await self.websocket_manager.send_error(document_id, error_msg)  # Fixed: added await
+                
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "result": error_msg
+                }
+                
         except Exception as e:
-            error_msg = f"Error processing command: {str(e)}"
+            error_msg = f"Command processing error: {str(e)}"
             if self.websocket_manager:
-                await self.websocket_manager.broadcast_to_document({
-                    "type": "error",
-                    "message": error_msg
-                }, document_id)
+                await self.websocket_manager.send_error(document_id, error_msg)  # Fixed: added await
+            
             return {
                 "success": False,
-                "error": error_msg
+                "error": error_msg,
+                "result": error_msg
             }
     
     def _create_react_agent(self):
@@ -111,64 +141,50 @@ class DocumentAgent:
         tool_names = [tool.name for tool in self.tools]
         
         react_prompt = PromptTemplate.from_template("""
-You are an expert PDF document modification agent with access to 23 comprehensive PDF manipulation tools. You can handle ANY user request for PDF manipulation with precise font style preservation, advanced text processing, and complete document restructuring.
+You are an expert PDF document modification agent with access to comprehensive PDF manipulation tools.
 
-AVAILABLE TOOL CATEGORIES:
-• Text Manipulation: replace_text, add_text, remove_text, modify_paragraph, modify_sentence, add_content
-• Font Preservation: All text tools preserve formatting by default, get_text_formatting, font_analysis
-• Document Analysis: analyze_pdf, extract_text, fuzzy_search, font_analysis
-• Page Operations: swap_pages, extract_pages, rotate_pages, remove_pages, split_pdf, merge_pdfs
-• Visual Enhancements: resize_images, add_annotation, highlight_text, add_watermark
-• Advanced Operations: batch_operation, fuzzy_search, font_analysis
+CRITICAL TOOL SELECTION RULES:
+- For "change background color" requests: ALWAYS use "change_background_color" tool
+- For "change title" requests: Use "change_title" tool
+- For text modifications: Use "replace_text", "add_text", or "remove_text"
+- For page operations: Use "swap_pages", "extract_pages", "rotate_pages"
+- For visual enhancements: Use "add_watermark", "highlight_text", "resize_images"
 
-KEY CAPABILITIES:
-- Text replacement with exact font style preservation and fuzzy matching
-- Paragraph/sentence-level modifications with formatting retention
-- Content insertion with automatic font matching to surrounding text
-- Comprehensive document analysis (structure, fonts, colors, formatting)
-- Batch operations for complex multi-step modifications
-- Page manipulation (rotate, extract, merge, split, swap)
-- Visual enhancements (annotations, highlights, watermarks)
-- Advanced search with fuzzy matching for flexible text identification
-
-FONT PRESERVATION PROTOCOL:
-1. ALWAYS preserve original font styles unless explicitly instructed otherwise
-2. Use preserve_formatting=true by default for ALL text operations
-3. Analyze document formatting FIRST using analyze_pdf tool
-4. Match surrounding text formatting when adding new content
-5. Use get_text_formatting tool to inspect specific text properties
-6. Maintain visual consistency throughout all modifications
-
-WORKFLOW BEST PRACTICES:
-1. Start with analyze_pdf to understand document structure and formatting
-2. Use extract_text to understand content context when needed
-3. Use fuzzy_search for flexible text identification
-4. Perform modifications using appropriate tools with font preservation
-5. Use batch_operation for complex multi-step processes
-6. Always provide clear feedback about modifications made
-
-EXAMPLE COMMANDS YOU CAN HANDLE:
-- "Replace all instances of 'ABC Corp' with 'XYZ Industries' keeping original fonts"
-- "Add a confidentiality notice at the top of each page matching header font"
-- "Convert bullet points in section 3 to numbered list"
-- "Merge pages 1-3 from document A with pages 5-7 from document B"
-- "Rotate all landscape pages to portrait orientation"
-- "Add watermark 'DRAFT' with 30% opacity to all pages"
-- "Extract financial data from pages 10-15 and create new document"
-- "Highlight all mentions of 'revenue' in yellow"
-- "Swap pages 2 and 5, then add page numbers"
-
+AVAILABLE TOOLS:
 {tools}
+
+IMPORTANT: When using tools, you MUST provide the pdf_path parameter from the input.
+
+Example for background color change:
+Input: "Document: /path/to/file.pdf\nCommand: change the background color to yellow"
+Action: change_background_color
+Action Input: {{"pdf_path": "/path/to/file.pdf", "color": "yellow", "opacity": 0.3}}
+
+Example for title change:
+Input: "Document: /path/to/file.pdf\nCommand: change the title from Biruk to Ayele"
+Action: change_title
+Action Input: {{"pdf_path": "/path/to/file.pdf", "current_title": "Biruk", "new_title": "Ayele"}}
+
+Example for text replacement:
+Input: "Document: /path/to/file.pdf\nCommand: change the text that says Biruk to Ayele"
+Action: replace_text
+Action Input: {{"pdf_path": "/path/to/file.pdf", "old_text": "Biruk", "new_text": "Ayele"}}
+
+WORKFLOW:
+1. Extract the document path from the input
+2. Identify the appropriate tool based on the command
+3. Execute the tool with proper parameters
+4. Return the result with the modified file path
 
 Use the following format:
 Question: the input question/command you must answer
-Thought: you should always think about what to do
+Thought: you should always think about what to do and which tool to use
 Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
+Action Input: the input to the action as a JSON object
 Observation: the result of the action
 ... (this Thought/Action/Action Input/Observation can repeat N times)
 Thought: I now know the final answer
-Final Answer: the final answer to the original input question
+Final Answer: the final answer with the result file path
 
 Question: {input}
 {agent_scratchpad}
@@ -237,7 +253,7 @@ Question: {input}
             
             # Send completion update
             if self.websocket_manager:
-                await self.websocket_manager.send_manipulation_complete(
+                self.websocket_manager.send_manipulation_complete(
                     document_id=document_id,
                     operation="document_modification",
                     result_path=final_path,

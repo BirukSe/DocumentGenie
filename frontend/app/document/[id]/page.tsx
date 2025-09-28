@@ -33,6 +33,8 @@ interface WebSocketMessage {
   timestamp?: number;
   preview_url?: string;
   result_path?: string;
+  modified_file?: string;  // Added for background color changes
+  success?: boolean;      // Added for operation status
 }
 
 export default function DocumentViewer() {
@@ -42,6 +44,8 @@ export default function DocumentViewer() {
   const [pdfUrl, setPdfUrl] = useState<string>('');
   const [isDark, setIsDark] = useState(true);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [isSaving, setIsSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<{type: 'success' | 'error', message: string} | null>(null);
   const [inputMessage, setInputMessage] = useState('');
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isChatExpanded, setIsChatExpanded] = useState(false);
@@ -51,6 +55,7 @@ export default function DocumentViewer() {
   const [currentOperation, setCurrentOperation] = useState('');
   const [sessionInitialized, setSessionInitialized] = useState(false);
   const [previewUrl, setPreviewUrl] = useState('');
+  const [iframeKey, setIframeKey] = useState(0);
   const router = useRouter();
   const params = useParams();
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -204,15 +209,30 @@ export default function DocumentViewer() {
         setIsProcessing(false);
         setHasUnsavedChanges(true);
         
-        // Handle both preview_url and result_path for backward compatibility
-        const previewUrl = message.preview_url || 
-                         (message.result_path ? `/api/temp-preview/${params.id}?t=${Date.now()}` : '');
+        // CRITICAL FIX: Force iframe refresh with cache busting
+        const timestamp = Date.now();
+        const previewUrl = `/api/temp-preview/${params.id}?t=${timestamp}`;
+        const fullUrl = `http://localhost:8000${previewUrl}`;
         
-        if (previewUrl) {
-          // Add timestamp to prevent caching
-          const urlWithTimestamp = `http://localhost:8000${previewUrl}${previewUrl.includes('?') ? '&' : '?'}t=${Date.now()}`;
-          setPreviewUrl(urlWithTimestamp);
-          setPdfUrl(urlWithTimestamp);
+        console.log('🔄 Forcing PDF refresh with URL:', fullUrl);
+        
+        // Force iframe refresh by clearing and setting new URL
+        setPdfUrl('');
+        setIframeKey(prev => prev + 1); // Force iframe re-render
+        
+        // Use a longer delay to ensure proper refresh
+        setTimeout(() => {
+          setPdfUrl(fullUrl);
+          setPreviewUrl(fullUrl);
+          console.log('✅ PDF URL updated:', fullUrl);
+        }, 200); // Increased delay for better reliability
+        
+        // Update document object
+        if (document) {
+          setDocument({
+            ...document,
+            file_url: fullUrl
+          });
         }
         
         const completeMessage: ChatMessage = {
@@ -223,6 +243,46 @@ export default function DocumentViewer() {
           status: 'completed'
         };
         setChatMessages(prev => [...prev, completeMessage]);
+        break;
+        
+      case 'document_reset':
+        setCurrentProgress(0);
+        setIsProcessing(false);
+        setHasUnsavedChanges(false);
+        
+        // Handle document reset - refresh to original
+        const resetTimestamp = Date.now();
+        const resetPreviewUrl = `/api/temp-preview/${params.id}?t=${resetTimestamp}`;
+        const resetFullUrl = `http://localhost:8000${resetPreviewUrl}`;
+        
+        console.log('🔄 Document reset - refreshing to original:', resetFullUrl);
+        
+        // Force iframe refresh
+        setPdfUrl('');
+        setIframeKey(prev => prev + 1);
+        
+        setTimeout(() => {
+          setPdfUrl(resetFullUrl);
+          setPreviewUrl(resetFullUrl);
+          console.log('✅ Document reset - PDF URL updated:', resetFullUrl);
+        }, 200);
+        
+        // Update document object
+        if (document) {
+          setDocument({
+            ...document,
+            file_url: resetFullUrl
+          });
+        }
+        
+        const resetMessage: ChatMessage = {
+          id: Date.now().toString(),
+          type: 'system',
+          content: message.message || 'Document reset to original state',
+          timestamp: new Date(),
+          status: 'completed'
+        };
+        setChatMessages(prev => [...prev, resetMessage]);
         break;
         
       case 'error':
@@ -297,6 +357,49 @@ export default function DocumentViewer() {
 
   const handleSaveChanges = async () => {
     if (!document?.id || !hasUnsavedChanges) return;
+    
+    setIsSaving(true);
+    setSaveStatus(null);
+    
+    try {
+      const response = await fetch(`/api/documents/${document.id}/save`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          // Add auth headers if needed
+        },
+      });
+      
+      if (!response.ok) {
+        const error = await response.json();
+        throw new Error(error.detail || 'Failed to save changes');
+      }
+      
+      const result = await response.json();
+      
+      // Update the document URL to ensure we get the latest version
+      if (result.file_url) {
+        setPdfUrl(`${result.file_url}?t=${Date.now()}`);
+      }
+      
+      setHasUnsavedChanges(false);
+      setSaveStatus({
+        type: 'success',
+        message: 'Document saved successfully!'
+      });
+      
+      // Clear success message after 3 seconds
+      setTimeout(() => setSaveStatus(null), 3000);
+      
+    } catch (error) {
+      console.error('Error saving document:', error);
+      setSaveStatus({
+        type: 'error',
+        message: error instanceof Error ? error.message : 'Failed to save changes'
+      });
+    } finally {
+      setIsSaving(false);
+    }
     
     try {
       const response = await fetch('http://localhost:8000/api/document/save', {
@@ -447,6 +550,25 @@ export default function DocumentViewer() {
                 </div>
               )}
               
+              {/* Manual refresh button for testing */}
+              <button
+                onClick={() => {
+                  const timestamp = Date.now();
+                  const newUrl = `http://localhost:8000/api/temp-preview/${params.id}?t=${timestamp}`;
+                  console.log('🔄 Manual refresh to:', newUrl);
+                  setPdfUrl('');
+                  setIframeKey(prev => prev + 1);
+                  setTimeout(() => {
+                    setPdfUrl(newUrl);
+                  }, 100);
+                }}
+                className="flex items-center space-x-2 px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+                title="Refresh PDF"
+              >
+                <span className="text-sm">🔄</span>
+                <span className="text-sm">Refresh</span>
+              </button>
+              
               <button
                 onClick={() => setIsFullscreen(!isFullscreen)}
                 className={`p-2 rounded-lg transition-colors ${isDark ? 'bg-gray-700 hover:bg-gray-600 text-gray-300' : 'bg-gray-200 hover:bg-gray-300 text-gray-600'}`}
@@ -485,9 +607,12 @@ export default function DocumentViewer() {
             {pdfUrl ? (
               <div className="h-full w-full">
                 <iframe
+                  key={`${iframeKey}-${pdfUrl}`} // Force re-render when key or URL changes
                   src={pdfUrl}
                   className="w-full h-full border-0 rounded-lg shadow-lg"
                   title={document.name}
+                  onLoad={() => console.log('📄 PDF iframe loaded:', pdfUrl)}
+                  onError={() => console.error('❌ PDF iframe error:', pdfUrl)}
                 />
               </div>
             ) : (
